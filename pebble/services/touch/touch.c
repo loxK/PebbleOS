@@ -17,6 +17,7 @@
 #include <kernel/event_loop.h>
 #include <kernel/events.h>
 #include <kernel/pebble_tasks.h>
+#include <process_management/app_manager.h>
 #include <syscall/syscall.h>
 
 PBL_LOG_MODULE_DEFINE(service_touch, CONFIG_SERVICE_TOUCH_LOG_LEVEL);
@@ -33,6 +34,13 @@ static uint8_t s_subscriber_count = 0;
 //! system-slot handlers share the same per-task event-service subscription, so
 //! raw subscribers cannot be derived from s_subscriber_count.
 static uint8_t s_raw_subscriber_tasks = 0;
+//! Subset of s_subscriber_count that must never power the sensor: a watchface
+//! rides whatever a system holder already keeps on and powers nothing itself.
+static uint8_t s_passive_subscriber_count = 0;
+//! Bitmask by PebbleTask of the subscriptions counted in
+//! s_passive_subscriber_count, so the remove path unwinds the same accounting
+//! the add path chose (the task may no longer be a watchface by then).
+static uint8_t s_passive_subscriber_tasks = 0;
 static bool s_backlight_subscribed = false;
 static bool s_system_hold_subscribed = false;
 static bool s_nav_enabled = false;
@@ -51,10 +59,16 @@ static void prv_apply_rotation(int16_t *x, int16_t *y) {
   }
 }
 
-//! Powers the sensor while touch is globally enabled and has subscribers. Caller must hold
-//! s_touch_mutex.
+//! Subscribers that power the sensor. A passive subscriber is delivered
+//! whatever the sensor already produces but never turns it on.
+static uint8_t prv_powering_subscriber_count(void) {
+  return s_subscriber_count - s_passive_subscriber_count;
+}
+
+//! Powers the sensor while touch is globally enabled and has powering subscribers. Caller
+//! must hold s_touch_mutex.
 static void prv_update_sensor(void) {
-  const bool enable = s_globally_enabled && (s_subscriber_count > 0);
+  const bool enable = s_globally_enabled && (prv_powering_subscriber_count() > 0);
   int ret;
 
   if (enable == s_sensor_enabled) {
@@ -76,15 +90,25 @@ static void prv_update_sensor(void) {
 
 static void prv_add_subscriber_cb(PebbleTask task) {
   pbl_mutex_lock(&s_touch_mutex, PBL_FOREVER);
+  const bool passive = (task == PebbleTask_App) && app_manager_is_watchface_running();
+  if (passive) {
+    s_passive_subscriber_tasks |= (uint8_t)(1u << task);
+    s_passive_subscriber_count++;
+  }
   s_subscriber_count++;
   prv_update_sensor();
-  PBL_LOG_DBG("Touch: subscriber added, count=%" PRIu8, s_subscriber_count);
+  PBL_LOG_DBG("Touch: subscriber added, count=%" PRIu8 " (passive=%" PRIu8 ")", s_subscriber_count,
+              s_passive_subscriber_count);
   pbl_mutex_unlock(&s_touch_mutex);
 }
 
 static void prv_remove_subscriber_cb(PebbleTask task) {
   pbl_mutex_lock(&s_touch_mutex, PBL_FOREVER);
   PBL_ASSERTN(s_subscriber_count > 0);
+  if (s_passive_subscriber_tasks & (1u << task)) {
+    s_passive_subscriber_tasks &= (uint8_t)~(1u << task);
+    s_passive_subscriber_count--;
+  }
   s_subscriber_count--;
   prv_update_sensor();
   // An app whose shared touch subscription disappears (task exit, or both
