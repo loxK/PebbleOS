@@ -1,1 +1,2 @@
 # obelix pvt board revision configuration
+CONFIG_DEMO_APP_SPO2_TEST=y
